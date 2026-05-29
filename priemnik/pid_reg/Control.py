@@ -24,9 +24,9 @@ class Control_loop:
     def __init__(self):
 
         self.hz = 1000
-        self.angle_hz = 5
-        self.vel_hz = 15
-        self.pos_hz = 50
+        self.angle_hz = 200
+        self.vel_hz = 50
+        self.pos_hz = 10
         self.dt = float( 1.0 / self.hz)
         
         ####         ПАРСИМ КОЭФФИЦИЕНТЫ ПИДов И РЕЖИМ ПРОШИВКИ      #####
@@ -34,13 +34,14 @@ class Control_loop:
         self.P_rate, self.I_rate, self.D_rate = coeffs_arr[0], coeffs_arr[1], coeffs_arr[2]
         self.P_angular, self.D_angular = coeffs_arr[3], coeffs_arr[4]
         self.P_vel, self.I_vel = coeffs_arr[5], coeffs_arr[6]
-        self.firmwmode = coeffs_arr[7]
+        self.P_pos = coeffs_arr[7]
+        self.firmwmode = coeffs_arr[8]
         #####################################################################
 
         #---  ИНИЦИАЛИЗИРУЕМ ПИДЫ   -----
-        self.pid_roll = pid.PID(self.P_rate, self.I_rate, self.D_rate, self.P_angular, self.D_angular, self.P_vel, self.I_vel, self.hz, self.angle_hz, self.vel_hz, self.pos_hz, self.firmwmode)
-        self.pid_pitch = pid.PID(self.P_rate, self.I_rate, self.D_rate, self.P_angular, self.D_angular, self.P_vel, self.I_vel, self.hz, self.angle_hz, self.vel_hz, self.pos_hz, self.firmwmode)
-        self.pid_yaw = pid.PID(self.P_rate, self.I_rate, self.D_rate, self.P_angular, self.D_angular, self.P_vel, self.I_vel, self.hz, self.angle_hz, self.vel_hz, self.pos_hz, self.firmwmode)
+        self.pid_roll = pid.PID(self.P_rate, self.I_rate, self.D_rate, self.P_angular, self.D_angular, self.P_vel, self.I_vel, self.P_pos, self.hz, self.angle_hz, self.vel_hz, self.pos_hz, self.firmwmode)
+        self.pid_pitch = pid.PID(self.P_rate, self.I_rate, self.D_rate, self.P_angular, self.D_angular, self.P_vel, self.I_vel, self.P_pos, self.hz, self.angle_hz, self.vel_hz, self.pos_hz, self.firmwmode)
+        self.pid_yaw = pid.PID(self.P_rate, self.I_rate, self.D_rate, self.P_angular, self.D_angular, self.P_vel, self.I_vel, self.P_pos, self.hz, self.angle_hz, self.vel_hz, self.pos_hz, self.firmwmode)
         #----------------------------------------
 
         self.rc_raw = {'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0, 'throttle': 0.0, 'timespan': 0.0}
@@ -59,7 +60,6 @@ class Control_loop:
 
 
     def control_loop_func(self):
-        
         self.enable_airsim_api()
         self.arm_drone()
         
@@ -157,7 +157,7 @@ class Control_loop:
 
             pwm_to_esc = allocator.allocator(signals)#передаём в аллокатор полученные от ПИД-регуляторов требуемый ШИМ для каждой из осей, включая тягу
             total_pwm = [pwm_to_esc[0], pwm_to_esc[1], pwm_to_esc[2], pwm_to_esc[3], 0.0, 0.0, 0.0, 0.0] #первые 4 значения - ШИМ для каждой из осей, а остальные (0.0) - нуль.зн. для того, чтобы заполнить нужные параметры в сообщении MAVLink
-        
+
             self.airsim_client.moveByMotorPWMsAsync(
                 front_right_pwm=total_pwm[1],
                 rear_left_pwm=total_pwm[3], 
