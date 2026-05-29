@@ -1,6 +1,6 @@
 import math
 import threading
-import sys
+import sys, csv
 from upravlenie import keyboard_joy as j
 from filters import pt as filt
 import time
@@ -23,7 +23,7 @@ class Control_loop:
 
     def __init__(self):
 
-        self.hz = 500
+        self.hz = 1000
         self.angle_hz = 5
         self.vel_hz = 15
         self.pos_hz = 50
@@ -64,9 +64,9 @@ class Control_loop:
         self.arm_drone()
         
         
-        pt_gyro_x = filt.PT3(fc = 100, Fs = 400)
-        pt_gyro_y = filt.PT3(fc = 100, Fs = 400)
-        pt_gyro_z = filt.PT3(fc = 100, Fs = 400)
+        pt_gyro_x = filt.PT3(fc = 100, Fs = self.hz)
+        pt_gyro_y = filt.PT3(fc = 100, Fs = self.hz)
+        pt_gyro_z = filt.PT3(fc = 100, Fs = self.hz)
        
         tick_counter_for_rc = 0 #считаем время работы в мс
         all_time_counter = 0
@@ -79,6 +79,7 @@ class Control_loop:
 
         dt_target = 1.0 / self.hz
         t_prev = time.perf_counter()
+        loss_counter = 0
 
         while True:
 
@@ -101,16 +102,12 @@ class Control_loop:
 
             gyro_x = float(imu.kinematics_estimated.angular_velocity.x_val * (180 / math.pi))
             gyro_y = float(imu.kinematics_estimated.angular_velocity.y_val * (180 / math.pi))
-            # gyro_y = -float(imu.kinematics_estimated.angular_velocity.y_val * (180 / math.pi))
             gyro_z = float(imu.kinematics_estimated.angular_velocity.z_val * (180 / math.pi))
 
             
             clean_gyro_x  = pt_gyro_x.pt3(gyro_x) 
             clean_gyro_y  = pt_gyro_y.pt3(gyro_y) 
             clean_gyro_z  = pt_gyro_z.pt3(gyro_z)
-            # clean_gyro_x  = gyro_x
-            # clean_gyro_y  = gyro_y
-            # clean_gyro_z  = gyro_z
 
             clean_acc_x = imu.kinematics_estimated.linear_acceleration.x_val
             clean_acc_y = imu.kinematics_estimated.linear_acceleration.y_val
@@ -160,13 +157,13 @@ class Control_loop:
 
             pwm_to_esc = allocator.allocator(signals)#передаём в аллокатор полученные от ПИД-регуляторов требуемый ШИМ для каждой из осей, включая тягу
             total_pwm = [pwm_to_esc[0], pwm_to_esc[1], pwm_to_esc[2], pwm_to_esc[3], 0.0, 0.0, 0.0, 0.0] #первые 4 значения - ШИМ для каждой из осей, а остальные (0.0) - нуль.зн. для того, чтобы заполнить нужные параметры в сообщении MAVLink
-
+        
             self.airsim_client.moveByMotorPWMsAsync(
                 front_right_pwm=total_pwm[1],
                 rear_left_pwm=total_pwm[3], 
                 front_left_pwm=total_pwm[0], 
                 rear_right_pwm=total_pwm[2],
-                duration= actual_dt * 2, 
+                duration= 1.0, 
                 vehicle_name=self.DRONE_NAME
             )
 
@@ -180,6 +177,8 @@ class Control_loop:
                 t_end = time.perf_counter() + remaining
                 while time.perf_counter() < t_end:
                     pass
+            elif remaining < 0:
+                loss_counter += 1
 
             if all_time_counter % 100 == 0:
                 acc_arr = [clean_acc_x, clean_acc_y, clean_acc_z]
@@ -189,7 +188,8 @@ class Control_loop:
                 pids = [PID_roll, PID_pitch, PID_yaw, PID_thrust]
                 setp = [roll_vel_setpoint, pitch_vel_setpoint, yaw_vel_setpoint, roll_ang_setpoint, pitch_ang_setpoint, yaw_ang_setpoint, roll_rate_setpoint, pitch_rate_setpoint, yaw_rate_setpoint]
                 ticks = [roll_rate_ticks, pitch_rate_ticks, yaw_rate_ticks, roll_ang_ticks, pitch_ang_ticks, yaw_ang_ticks]
-                self._print_dashboard(acc_arr, gyro_arr, rc, pwm_sended, pids, setp, ticks)
+                loss = [loss_counter, abs(remaining)]
+                self._print_dashboard(acc_arr, gyro_arr, rc, pwm_sended, pids, setp, ticks, loss)
 
 
 
@@ -221,7 +221,7 @@ class Control_loop:
         self.airsim_client.armDisarm(arm=True, vehicle_name=self.DRONE_NAME)   
     
     
-    def _print_dashboard(self, accel_b, gyro_b, rc, pwm, pids, setp, ticks):
+    def _print_dashboard(self, accel_b, gyro_b, rc, pwm, pids, setp, ticks, loss):
         # Каждая строка — это строго ОДИН элемент списка. 
         # Если нужна пустая строка для читаемости, просто ставим ""
         lines = [
@@ -237,6 +237,7 @@ class Control_loop:
             "", # Пустая строка вместо \n
             f"roll_rate_tick : {ticks[0]}, pitch_rate_tick: {ticks[1]}, yaw_rate_ticks: {ticks[2]}",
             f"roll_ang_tick  : {ticks[3]}, pitch_ang_tick: {ticks[4]}, yaw_ang_ticks: {ticks[5]}",
+            f"счётчик задержки: {loss[0]}, значение задержки: {loss[1]}",
             "", # Пустая строка вместо \n
             f"Отправленный PWM на ESC: m1: {pwm[0]}, m2: {pwm[1]}, m3: {pwm[2]}, m4: {pwm[3]}",
             "============================================"
@@ -266,7 +267,7 @@ class Control_loop:
                 if line:                     # пропускаем пустые строки
                     numbers.append(float(line))
             
-            if len(numbers) != 8:
+            if len(numbers) != 9:
                 print(f"Предупреждение: в файле найдено {len(numbers)} чисел, а ожидалось 8")
             
             return numbers
