@@ -2,6 +2,7 @@ from upravlenie import calibrate as cal
 from pid_reg import control_loop as cont_loop
 
 from  pid_reg import Control as control
+from filters import ckf_sanity_test
 
 def main():
 
@@ -33,6 +34,8 @@ def main():
     
     # control_loop = cont_loop.Control_loop(0.001,rc_pt_count,expo_number,dt,expo_alpha,expo_beta, low_amplitude_percent, max_val_in_percent_diapazon )
     # control_loop.main_cylce_func()
+
+
     control_loop = control.Control_loop()
     control_loop.control_loop_func()
 

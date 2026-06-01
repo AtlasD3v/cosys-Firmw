@@ -11,8 +11,10 @@ from filters import filt_rc
 
 from scipy.spatial.transform import Rotation
 import numpy as np
+from filters import CKF as cub_calm_filter
 
 import cosysairsim as airsim
+
 
 DRONE_CONNECT  = None
 
@@ -28,8 +30,17 @@ class Control_loop:
         self.vel_hz = 50
         self.pos_hz = 10
         self.dt = float( 1.0 / self.hz)
+
+        ####################ВСЁ ДЛЯ CKF
+        self.ckf_predict_hz = 250 #частота шага предсказания CKF = 300 Гц
+        self.ckf_work_ticks = self.hz / self.ckf_predict_hz
+        self.ckf_ticks_counter = 0
+        self.ckf_dt_counter = 0.0
+        self.ckf = cub_calm_filter.CKF(float(1.0 / self.ckf_predict_hz))
+        self.delta_angles = np.array([0.0, 0.0, 0.0, 0.0])
+        self.delta_velocity = np.array([0.0, 0.0, 0.0, 0.0])
         
-        ####         ПАРСИМ КОЭФФИЦИЕНТЫ ПИДов И РЕЖИМ ПРОШИВКИ      #####
+        ##################### ПАРСИМ КОЭФФИЦИЕНТЫ ПИДов И РЕЖИМ ПРОШИВКИ      #####
         coeffs_arr = self.update_PID_coefs()
         self.P_rate, self.I_rate, self.D_rate = coeffs_arr[0], coeffs_arr[1], coeffs_arr[2]
         self.P_angular, self.D_angular = coeffs_arr[3], coeffs_arr[4]
@@ -82,7 +93,8 @@ class Control_loop:
         loss_counter = 0
 
         while True:
-
+            
+            #ЗАСЕКАЕМ ВРЕМЯ РАБОТЫ ЦИКЛА#####################
             t_iter_start = time.perf_counter()
             actual_dt = t_iter_start - t_prev   # реальный dt для ПИД
             t_prev = t_iter_start
@@ -91,6 +103,7 @@ class Control_loop:
                 self.parallel_execute_filt_rc() #получаем новые значения с RC-пульта (данные сохраняются в переменных self.rc_raw['соответств. ось'])
                 tick_counter_for_rc = 0 # сбрасываем таймер
 
+
             #ПОЛУЧАЕМ ДАННЫЕ С ДАТЧИКОВ
             imu = self.airsim_client.getMultirotorState(vehicle_name=self.DRONE_NAME)
             
@@ -98,8 +111,6 @@ class Control_loop:
             ####################################################################################
             ############ ЧИСТИМ И ПЕРЕВОДИМ ДАННЫЕ В НУЖНЫЕ ФИЗИЧЕСКИЕ ВЕЛИЧИНЫ
             
-            
-
             gyro_x = float(imu.kinematics_estimated.angular_velocity.x_val * (180 / math.pi))
             gyro_y = float(imu.kinematics_estimated.angular_velocity.y_val * (180 / math.pi))
             gyro_z = float(imu.kinematics_estimated.angular_velocity.z_val * (180 / math.pi))
@@ -112,29 +123,30 @@ class Control_loop:
             clean_acc_x = imu.kinematics_estimated.linear_acceleration.x_val
             clean_acc_y = imu.kinematics_estimated.linear_acceleration.y_val
             clean_acc_z = imu.kinematics_estimated.linear_acceleration.z_val
-            ####################################################################################
-            ####################################################################################
 
+
+            #+++++++++++++ CKF +++++++++++++++++
+            self.ckf_worker(clean_gyro_x, clean_gyro_y, clean_gyro_z, clean_acc_x, clean_acc_y, clean_acc_z, actual_dt)
 
             #-----------------------------------------------------
             #------РАБОТАЕТ С ANGLE-контуром
-            if (all_time_counter % self.angle_hz == 0) or all_time_counter == 0:
+            # if (all_time_counter % self.angle_hz == 0) or all_time_counter == 0:
 
-                NED_quat = np.array(
-                    [
-                        imu.kinematics_estimated.orientation.w_val,
-                        imu.kinematics_estimated.orientation.x_val,
-                        imu.kinematics_estimated.orientation.y_val,
-                        imu.kinematics_estimated.orientation.z_val,
-                    ]
-                )
-                euler_angles = self.from_quat_to_euler(NED_quat)
+            #     NED_quat = np.array(
+            #         [
+            #             imu.kinematics_estimated.orientation.w_val,
+            #             imu.kinematics_estimated.orientation.x_val,
+            #             imu.kinematics_estimated.orientation.y_val,
+            #             imu.kinematics_estimated.orientation.z_val,
+            #         ]
+            #     )
+            #     euler_angles = self.from_quat_to_euler(NED_quat)
 
-                self.pid_roll.angle_measurement = euler_angles[0] #X
-                self.pid_pitch.angle_measurement = euler_angles[1] #Y
-                self.pid_yaw.angle_measurement = euler_angles[2] #Z
+            #     self.pid_roll.angle_measurement = euler_angles[0] #X
+            #     self.pid_pitch.angle_measurement = euler_angles[1] #Y
+            #     self.pid_yaw.angle_measurement = euler_angles[2] #Z
 
-                self.orientation_euler = euler_angles
+            #     self.orientation_euler = euler_angles
 
             #-----------------------------------------------------
             #-----------------------------------------------------
@@ -192,6 +204,50 @@ class Control_loop:
                 self._print_dashboard(acc_arr, gyro_arr, rc, pwm_sended, pids, setp, ticks, loss)
 
 
+    def ckf_worker(self, clean_gyro_x, clean_gyro_y, clean_gyro_z, clean_acc_x, clean_acc_y, clean_acc_z, actual_dt):
+
+        self.ckf_ticks_counter += 1
+        self.ckf_dt_counter += actual_dt
+
+        self.delta_angles[0] += self.grad_to_rad(clean_gyro_x) * actual_dt #ОБЯЗАТЕЛЬНО ПЕРЕВОДИМ ИЗ УГЛОВ ЭЙЛЕРА В РАДИАНЫ, ТАК КАК CKF РАБОТАЕТ В РАДИАНАХ
+        self.delta_angles[1] += self.grad_to_rad(clean_gyro_y) * actual_dt
+        self.delta_angles[2] += self.grad_to_rad(clean_gyro_z) * actual_dt #РАБОТАЕМ С ДЕЛЬТА-ВЕЛИЧИНАМИ, ТАК КАК DT НЕСТАБИЛЕН, ПОЭТМОМУ СРЕДНЕЕ БУДЕТ ЛОМАТЬ ПРАВИЛЬНОСТЬ ВЫЧИСЛЕНИЙ
+
+        self.delta_velocity[0] += clean_acc_x * actual_dt
+        self.delta_velocity[1] += clean_acc_y * actual_dt
+        self.delta_velocity[2] += clean_acc_z * actual_dt
+
+        if self.ckf_ticks_counter % self.ckf_work_ticks == 0:
+            gyro_x_to_ckf = float(self.delta_angles[0] / self.ckf_dt_counter)
+            gyro_y_to_ckf = float(self.delta_angles[1] / self.ckf_dt_counter)
+            gyro_z_to_ckf = float(self.delta_angles[2] / self.ckf_dt_counter)
+
+            clean_gyro_arr = [gyro_x_to_ckf, gyro_y_to_ckf, gyro_z_to_ckf]
+
+            acc_x_to_ckf = float(self.delta_velocity[0] / self.ckf_dt_counter)
+            acc_y_to_ckf = float(self.delta_velocity[1] / self.ckf_dt_counter)
+            acc_z_to_ckf = float(self.delta_velocity[2] / self.ckf_dt_counter)
+
+            clean_acc_arr = [acc_x_to_ckf, acc_y_to_ckf, acc_z_to_ckf]
+
+            state = self.ckf.predict_step(clean_gyro_arr, clean_acc_arr, self.ckf_dt_counter)
+
+            euler_angles = self.from_quat_to_euler(state.q)
+
+            self.pid_roll.angle_measurement = euler_angles[0] #X
+            self.pid_pitch.angle_measurement = euler_angles[1] #Y
+            self.pid_yaw.angle_measurement = euler_angles[2] #Z
+
+            self.orientation_euler = euler_angles
+
+
+            self.ckf_dt_counter = 0.0
+            self.ckf_ticks_counter = 0
+            self.delta_angles.fill(0.0)
+            self.delta_velocity.fill(0.0)
+
+    def grad_to_rad(self, grad):
+        return float(math.pi / 180) * grad
 
     def parallel_execute_filt_rc(self):#функция, которая параллельно запускает четыре функции фильтрации и изменения кривой управления RC-сигнала по всем степеням свободы
 
