@@ -87,7 +87,7 @@ class PID:
         if ( (self.ticks_counter % self.velocity_work_in_ticks == 0) or self.ticks_counter == 0 ) and self.firmwmode >= 2:
             
             if not self.is_setpoint_from_pos_contur: #если сетпоинт для velocity-контура устанавливается не из position контура, то находим setpoint сами
-                self.velocity_setpoint = self.max_lin_velocity * setpoint
+                self.velocity_setpoint = self.max_lin_velocity * -setpoint #инвертируем сетпоинт (при вводе с клавиатуры)
             
             #результатом работы veloctity-контура является setpoint для angle-контура, поэтому сразу результат работы велосити-контура приравниваем к англ-сетпоинту
             self.angle_setpoint = self.velocity_contur()
@@ -124,13 +124,13 @@ class PID:
         pre_result = self.compute_attitude_setpoint(P_part + self.I_Term_vel)#получаем угол из ускорения (ускорение получается в P_part)
         
 
-        if abs(self.I_term_vel) <= (self.max_lin_vel / (1.0 / self.velosity_hz)):
-            self.I_term_vel += self.I_vel * error * self.vel_dt
+        if abs(self.I_Term_vel <= 4.0):
+            self.I_Term_vel += self.I_vel * error * self.vel_dt
 
         result = max(-self.max_angle, min(pre_result, self.max_angle))
         self.vel_dt = 0.0
 
-        return result
+        return -result #инвертируем, так как чтобы набрать положительную скорость - нужен отрицательный угол
 
     def angle_contur(self):
         error = self.angle_setpoint - self.angle_measurement
