@@ -176,7 +176,7 @@ class Mathmodel:
       (тогда у неподвижного аппарата мировое ускорение = 0).
     """
 
-    GRAVITY = 9.81
+    GRAVITY = 9.80665
 
     def __init__(self):
         pass

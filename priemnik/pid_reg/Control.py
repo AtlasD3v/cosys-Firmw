@@ -13,15 +13,12 @@ from scipy.spatial.transform import Rotation
 import numpy as np
 from filters import CKF as cub_calm_filter
 
-import cosysairsim as airsim
-
-
+from cosysairsim_APIs.APIs_methods import Cosys_client as client
+from math_model import coordinates_converter as coord_conv
 DRONE_CONNECT  = None
 
 
 class Control_loop:
-    DRONE_NAME = "MyDrone"
-    AIRSIM_IP = "127.0.0.1"
 
     def __init__(self):
 
@@ -37,8 +34,8 @@ class Control_loop:
         self.ckf_ticks_counter = 0
         self.ckf_dt_counter = 0.0
         self.ckf = cub_calm_filter.CKF(float(1.0 / self.ckf_predict_hz))
-        self.delta_angles = np.array([0.0, 0.0, 0.0, 0.0])
-        self.delta_velocity = np.array([0.0, 0.0, 0.0, 0.0])
+        self.delta_angles = np.array([0.0, 0.0, 0.0])
+        self.delta_velocity = np.array([0.0, 0.0, 0.0])
         
         ##################### ПАРСИМ КОЭФФИЦИЕНТЫ ПИДов И РЕЖИМ ПРОШИВКИ      #####
         coeffs_arr = self.update_PID_coefs()
@@ -57,22 +54,25 @@ class Control_loop:
 
         self.rc_raw = {'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0, 'throttle': 0.0, 'timespan': 0.0}
         self.orientation_euler = [0.0, 0.0, 0.0]
+        self.gps_data = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         
         self.rc_filter = filt_rc.RC_filter()
 
         self.rc_update_interval = 20
+        self.gps_update_interval = int(self.hz / self.pos_hz) #часота получения данных от GPS
 
-        self.airsim_client = airsim.MultirotorClient(self.AIRSIM_IP)
-        self.airsim_client.reset()
-        self.airsim_client.confirmConnection()
-        print("[BRIDGE] Подключились к Cosys-AirSim")
+        self.airsim_client = client()
+
+        ####ПЕРЕМЕННЫЕ ДЛЯ ЗАПОМИНАНИЯ НАЧАЛЬНЫХ КООРДИНАТ ДРОНА, ЧТОБЫ ПОТОМ С ПОМОЩЬЮ НИХ ВЫЧИСЛЯТЬ ПРОЙДЕННУЮ ДИСТАНЦИЮ
+        self.coords = coord_conv.Coord_converter()
+        
         
 
 
 
     def control_loop_func(self):
-        self.enable_airsim_api()
-        self.arm_drone()
+        self.airsim_client.enable_airsim_api()
+        self.airsim_client.arm_drone()
         
         
         pt_gyro_x = filt.PT3(fc = 100, Fs = self.hz)
@@ -80,6 +80,7 @@ class Control_loop:
         pt_gyro_z = filt.PT3(fc = 100, Fs = self.hz)
        
         tick_counter_for_rc = 0 #считаем время работы в мс
+        tick_counter_for_gps = 0 #считаем тики для получения данных с GPS
         all_time_counter = 0
 
         allocator = alloc.Allocator(1) #инициализация аллокатора с конфигурацией ВМГ №0 
@@ -103,61 +104,54 @@ class Control_loop:
                 self.parallel_execute_filt_rc() #получаем новые значения с RC-пульта (данные сохраняются в переменных self.rc_raw['соответств. ось'])
                 tick_counter_for_rc = 0 # сбрасываем таймер
 
-
             #ПОЛУЧАЕМ ДАННЫЕ С ДАТЧИКОВ
-            imu = self.airsim_client.getMultirotorState(vehicle_name=self.DRONE_NAME)
+            imu = self.airsim_client.get_imu() #возвращаем данные IMU в формате [gyro_x, gyro_y, gyro_z, acc_x, acc_y, acc_z]
             
 
             ####################################################################################
             ############ ЧИСТИМ И ПЕРЕВОДИМ ДАННЫЕ В НУЖНЫЕ ФИЗИЧЕСКИЕ ВЕЛИЧИНЫ
             
-            gyro_x = float(imu.kinematics_estimated.angular_velocity.x_val * (180 / math.pi))
-            gyro_y = float(imu.kinematics_estimated.angular_velocity.y_val * (180 / math.pi))
-            gyro_z = float(imu.kinematics_estimated.angular_velocity.z_val * (180 / math.pi))
+            gyro_x = float(imu[0] * (180 / math.pi))
+            gyro_y = float(imu[1] * (180 / math.pi))
+            gyro_z = float(imu[2] * (180 / math.pi))
 
             
             clean_gyro_x  = pt_gyro_x.pt3(gyro_x) 
             clean_gyro_y  = pt_gyro_y.pt3(gyro_y) 
             clean_gyro_z  = pt_gyro_z.pt3(gyro_z)
 
-            clean_acc_x = imu.kinematics_estimated.linear_acceleration.x_val
-            clean_acc_y = imu.kinematics_estimated.linear_acceleration.y_val
-            clean_acc_z = imu.kinematics_estimated.linear_acceleration.z_val
+            clean_acc_x = imu[3]
+            clean_acc_y = imu[4]
+            clean_acc_z = imu[5]
 
 
-            #+++++++++++++ CKF +++++++++++++++++
+            ################# CKF
             self.ckf_worker(clean_gyro_x, clean_gyro_y, clean_gyro_z, clean_acc_x, clean_acc_y, clean_acc_z, actual_dt)
 
-            #-----------------------------------------------------
-            #------РАБОТАЕТ С ANGLE-контуром
-            # if (all_time_counter % self.angle_hz == 0) or all_time_counter == 0:
+            if  all_time_counter % self.gps_update_interval == 0: #запускаем шаг коррекции только после шага обновления с актуальными данные с гироскопа и акселерометра, чтобы коррекция применялась к актуальным данным
 
-            #     NED_quat = np.array(
-            #         [
-            #             imu.kinematics_estimated.orientation.w_val,
-            #             imu.kinematics_estimated.orientation.x_val,
-            #             imu.kinematics_estimated.orientation.y_val,
-            #             imu.kinematics_estimated.orientation.z_val,
-            #         ]
-            #     )
-            #     euler_angles = self.from_quat_to_euler(NED_quat)
+                #метод correction_step() принимает GPS_data, который подразумевает под собой [pos_x, pos_y, pos_z, vel_x, vel_y, vel_z] 
 
-            #     self.pid_roll.angle_measurement = euler_angles[0] #X
-            #     self.pid_pitch.angle_measurement = euler_angles[1] #Y
-            #     self.pid_yaw.angle_measurement = euler_angles[2] #Z
+                gps_data = self.airsim_client.get_gps_data() #получаем [pos_latitude, pos_longitude, pos_altitude, velocity_x, velocity_y, velocity_z]
 
-            #     self.orientation_euler = euler_angles
+                if all_time_counter == 0: #если только в первый раз получили координаты от GPS - устанавливаем их, как домашние
+                    self.coords.initialize_home_coordinates(gps_data[0], gps_data[1], gps_data[2])
 
-            #-----------------------------------------------------
-            #-----------------------------------------------------
+                pos_in_local_meters = self.coords.convert_coords_to_local_meters(gps_data[0], gps_data[1], gps_data[2]) #переводим координаты в метры
 
-            ####################################################
+                #составляем конечный массив gps-данных для отправки в шаг коррекции CKF
+                total_gps_data_arr = [pos_in_local_meters[0], pos_in_local_meters[1], pos_in_local_meters[2], gps_data[3], gps_data[4], gps_data[5]]
+
+                #вызываем коррекционный шаг
+                self.gps_data = total_gps_data_arr
+                self.ckf_worker(is_correction_step=True, gps_data=total_gps_data_arr)
+                
+
+
             ######ПЕРЕДАЁМ ОЧИЩЕННЫЕ ИЗМЕРЕНИЯ ГИРОСКОПОВ В ПИДы ПО СООТВЕТСТВУЮЩИМ ОСЯМ
             self.pid_roll.gyro_measurement = clean_gyro_x
             self.pid_pitch.gyro_measurement = clean_gyro_y
             self.pid_yaw.gyro_measurement = clean_gyro_z
-            ####################################################
-            ####################################################
 
 
             PID_roll, roll_vel_setpoint, roll_ang_setpoint, roll_rate_setpoint, roll_rate_ticks, roll_ang_ticks = self.pid_roll.cascade(self.rc_raw['roll'], actual_dt)
@@ -175,8 +169,7 @@ class Control_loop:
                 rear_left_pwm=total_pwm[3], 
                 front_left_pwm=total_pwm[0], 
                 rear_right_pwm=total_pwm[2],
-                duration= 1.0, 
-                vehicle_name=self.DRONE_NAME
+                duration= 1.0
             )
 
             tick_counter_for_rc += 1
@@ -204,35 +197,76 @@ class Control_loop:
                 self._print_dashboard(acc_arr, gyro_arr, rc, pwm_sended, pids, setp, ticks, loss)
 
 
-    def ckf_worker(self, clean_gyro_x, clean_gyro_y, clean_gyro_z, clean_acc_x, clean_acc_y, clean_acc_z, actual_dt):
+    def ckf_worker(self, clean_gyro_x  = None, clean_gyro_y = None, clean_gyro_z = None, clean_acc_x = None, clean_acc_y = None, clean_acc_z = None, actual_dt = None, is_correction_step = False, gps_data = None):
 
-        self.ckf_ticks_counter += 1
-        self.ckf_dt_counter += actual_dt
+        if not is_correction_step:
+            self.ckf_ticks_counter += 1
+            self.ckf_dt_counter += actual_dt
 
-        self.delta_angles[0] += self.grad_to_rad(clean_gyro_x) * actual_dt #ОБЯЗАТЕЛЬНО ПЕРЕВОДИМ ИЗ УГЛОВ ЭЙЛЕРА В РАДИАНЫ, ТАК КАК CKF РАБОТАЕТ В РАДИАНАХ
-        self.delta_angles[1] += self.grad_to_rad(clean_gyro_y) * actual_dt
-        self.delta_angles[2] += self.grad_to_rad(clean_gyro_z) * actual_dt #РАБОТАЕМ С ДЕЛЬТА-ВЕЛИЧИНАМИ, ТАК КАК DT НЕСТАБИЛЕН, ПОЭТМОМУ СРЕДНЕЕ БУДЕТ ЛОМАТЬ ПРАВИЛЬНОСТЬ ВЫЧИСЛЕНИЙ
+            self.delta_angles[0] += self.grad_to_rad(clean_gyro_x) * actual_dt #ОБЯЗАТЕЛЬНО ПЕРЕВОДИМ ИЗ УГЛОВ ЭЙЛЕРА В РАДИАНЫ, ТАК КАК CKF РАБОТАЕТ В РАДИАНАХ
+            self.delta_angles[1] += self.grad_to_rad(clean_gyro_y) * actual_dt
+            self.delta_angles[2] += self.grad_to_rad(clean_gyro_z) * actual_dt #РАБОТАЕМ С ДЕЛЬТА-ВЕЛИЧИНАМИ, ТАК КАК DT НЕСТАБИЛЕН, ПОЭТМОМУ СРЕДНЕЕ БУДЕТ ЛОМАТЬ ПРАВИЛЬНОСТЬ ВЫЧИСЛЕНИЙ
 
-        self.delta_velocity[0] += clean_acc_x * actual_dt
-        self.delta_velocity[1] += clean_acc_y * actual_dt
-        self.delta_velocity[2] += clean_acc_z * actual_dt
+            self.delta_velocity[0] += clean_acc_x * actual_dt
+            self.delta_velocity[1] += clean_acc_y * actual_dt
+            self.delta_velocity[2] += clean_acc_z * actual_dt
 
-        if self.ckf_ticks_counter % self.ckf_work_ticks == 0:
-            gyro_x_to_ckf = float(self.delta_angles[0] / self.ckf_dt_counter)
-            gyro_y_to_ckf = float(self.delta_angles[1] / self.ckf_dt_counter)
-            gyro_z_to_ckf = float(self.delta_angles[2] / self.ckf_dt_counter)
+            if self.ckf_ticks_counter % self.ckf_work_ticks == 0:
+                gyro_x_to_ckf = float(self.delta_angles[0] / self.ckf_dt_counter)
+                gyro_y_to_ckf = float(self.delta_angles[1] / self.ckf_dt_counter)
+                gyro_z_to_ckf = float(self.delta_angles[2] / self.ckf_dt_counter)
 
-            clean_gyro_arr = [gyro_x_to_ckf, gyro_y_to_ckf, gyro_z_to_ckf]
+                clean_gyro_arr = [gyro_x_to_ckf, gyro_y_to_ckf, gyro_z_to_ckf]
 
-            acc_x_to_ckf = float(self.delta_velocity[0] / self.ckf_dt_counter)
-            acc_y_to_ckf = float(self.delta_velocity[1] / self.ckf_dt_counter)
-            acc_z_to_ckf = float(self.delta_velocity[2] / self.ckf_dt_counter)
+                acc_x_to_ckf = float(self.delta_velocity[0] / self.ckf_dt_counter)
+                acc_y_to_ckf = float(self.delta_velocity[1] / self.ckf_dt_counter)
+                acc_z_to_ckf = float(self.delta_velocity[2] / self.ckf_dt_counter)
 
-            clean_acc_arr = [acc_x_to_ckf, acc_y_to_ckf, acc_z_to_ckf]
+                clean_acc_arr = [acc_x_to_ckf, acc_y_to_ckf, acc_z_to_ckf]
 
-            state = self.ckf.predict_step(clean_gyro_arr, clean_acc_arr, self.ckf_dt_counter)
+                state = self.ckf.predict_step(clean_gyro_arr, clean_acc_arr, self.ckf_dt_counter)
 
-            euler_angles = self.from_quat_to_euler(state.q)
+                #после получения состояния обновляем данные в ПИД-регуляторах
+
+                #обновляем позиции
+                self.pid_roll.position_measurement = state.pos[1]#Y
+                self.pid_pitch.position_measurement = state.pos[0]#X
+                self.pid_yaw.position_measurement = state.pos[2]#Z
+
+                #обновляем скорости
+                self.pid_roll.velocity_measurement = state.vel[1] #Y
+                self.pid_pitch.velocity_measurement = state.vel[0] #X
+                self.pid_yaw.velocity_measurement = state.vel[2] #Z
+
+                euler_angles = self.from_quat_to_euler(state.q)
+
+                self.pid_roll.angle_measurement = euler_angles[0] #X
+                self.pid_pitch.angle_measurement = euler_angles[1] #Y
+                self.pid_yaw.angle_measurement = euler_angles[2] #Z
+
+                self.orientation_euler = euler_angles
+
+
+                self.ckf_dt_counter = 0.0
+                self.ckf_ticks_counter = 0
+                self.delta_angles.fill(0.0)
+                self.delta_velocity.fill(0.0)
+        else:
+            correct_state = self.ckf.correction_step(gps_data) #возвращает скорректированную структуру состояния дрона
+
+            #после получения состояния обновляем данные в ПИД-регуляторах
+
+            #обновляем позиции
+            self.pid_roll.position_measurement = correct_state.pos[1]#Y
+            self.pid_pitch.position_measurement = correct_state.pos[0]#X
+            self.pid_yaw.position_measurement = correct_state.pos[2]#Z
+
+            #обновляем скорости
+            self.pid_roll.velocity_measurement = correct_state.vel[1] #Y
+            self.pid_pitch.velocity_measurement = correct_state.vel[0] #X
+            self.pid_yaw.velocity_measurement = correct_state.vel[2] #Z
+
+            euler_angles = self.from_quat_to_euler(correct_state.q)
 
             self.pid_roll.angle_measurement = euler_angles[0] #X
             self.pid_pitch.angle_measurement = euler_angles[1] #Y
@@ -240,11 +274,6 @@ class Control_loop:
 
             self.orientation_euler = euler_angles
 
-
-            self.ckf_dt_counter = 0.0
-            self.ckf_ticks_counter = 0
-            self.delta_angles.fill(0.0)
-            self.delta_velocity.fill(0.0)
 
     def grad_to_rad(self, grad):
         return float(math.pi / 180) * grad
@@ -266,15 +295,6 @@ class Control_loop:
         self.rc_raw['yaw'] = sig_yaw
         self.rc_raw['throttle'] = sig_throttle
         self.rc_raw['timespan'] = timespan
-
-
-    def enable_airsim_api(self):
-        self.airsim_client.enableApiControl(is_enabled=True, vehicle_name=self.DRONE_NAME) #self.DRONE_NAME равен имени дрона, которое прописывается в файле settings.json
-        print("+++++ ВКЛЮЧИЛИ API +++++")
-
-    def arm_drone(self):
-        print("****[BRIDGE] АРМИРУЕМ ДРОН****")
-        self.airsim_client.armDisarm(arm=True, vehicle_name=self.DRONE_NAME)   
     
     
     def _print_dashboard(self, accel_b, gyro_b, rc, pwm, pids, setp, ticks, loss):
@@ -284,7 +304,12 @@ class Control_loop:
             "=== ТЕЛЕМЕТРИЯ ===",
             f"IMU Accel  : [{accel_b}]",
             f"IMU Gyro   : X: {round(float(gyro_b[0]), 2)}, Y: {round(float(gyro_b[1]), 2)}, Z: {round(float(gyro_b[2]), 2)}",
+            f"GPS_POSITION   : X: {self.gps_data[0]}, Y: {self.gps_data[1]}, Z: {self.gps_data[2]}",
+            f"GPS_VELOCITY   : X: {self.gps_data[3]}, Y: {self.gps_data[4]}, Z: {self.gps_data[5]}",
             "", # Пустая строка вместо \n
+            f"CKF_POSITION   : X: {self.ckf.state.pos[0]}, Y: {self.ckf.state.pos[1]}, Z: {self.ckf.state.pos[2]}",
+            f"CKF_VELOCITY   : X: {self.ckf.state.vel[0]}, Y: {self.ckf.state.vel[1]}, Z: {self.ckf.state.vel[2]}",
+            "",
             f"Setpoints_vel  : X: {round(setp[0], 2) if setp[0] is not None else 0.0}, Y: {round(setp[1], 2) if setp[1] is not None else 0.0}, Z: {round(setp[2], 2) if setp[2] is not None else 0.0}",
             f"Setpoints_ang  : X: {round(setp[3], 2) if setp[3] is not None else 0.0}, Y: {round(setp[4], 2) if setp[4] is not None else 0.0}, Z: {round(setp[5], 2) if setp[5] is not None else 0.0}",
             f"Setpoints_rate : X: {round(setp[6], 5) if setp[6] is not None else 0.0}, Y: {round(setp[7], 5) if setp[7] is not None else 0.0}, Z: {round(setp[8], 5) if setp[8] is not None else 0.0}",
