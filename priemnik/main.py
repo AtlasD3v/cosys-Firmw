@@ -13,12 +13,5 @@ def main():
     control_loop.control_loop_func()
 
 
-
-
-
-
-
-
-
 if __name__ == '__main__':
     main()
